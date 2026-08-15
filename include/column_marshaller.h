@@ -12,6 +12,9 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 #include "taper_hashtable.h"
 #include "row_container.h"
 #include "simple_arena_allocator.h"
@@ -293,7 +296,52 @@ private:
 
             if (colDescs_[groupColIdx] == ColumnDesc::Int64) {
                 const int64_t* inputValues = columns[groupColIdx].int64Data;
-#if defined(__aarch64__)
+#if defined(__ARM_FEATURE_SVE)
+                // SVE batch compare — matches OmniOperator SveBatchCompareNoNullDecoded<int64_t>
+                {
+                    svbool_t pgAll = svptrue_b64();
+                    int32_t i = idxFrom;
+                    while (i < count) {
+                        svbool_t pg = svwhilelt_b64_s32(i, count);
+                        int32_t activeCount = (int32_t)svcntp_b64(pgAll, pg);
+
+                        // Load indices
+                        svuint64_t vIdx = svld1sw_u64(pg, &workingUpdateIndices[i]);
+
+                        // Gather row pointers: groups[idx]
+                        svuint64_t vPtrOffsets = svlsl_n_u64_x(pg, vIdx, 3); // idx * 8
+                        svuint64_t vRowPtrs = svld1_gather_u64offset_u64(pg, reinterpret_cast<const uint64_t*>(groups.data()), vPtrOffsets);
+
+                        // Gather stored values: *(rowPtr + offset)
+                        svint64_t vStored = svld1_gather_s64offset_s64(pg, reinterpret_cast<const int64_t*>(0),
+                            svreinterpret_s64_u64(svadd_n_u64_x(pg, vRowPtrs, static_cast<uint64_t>(offset))));
+
+                        // Gather input values: inputValues[idx]
+                        svint64_t vInput = svld1_gather_s64index_s64(pg, inputValues, svreinterpret_s64_u64(vIdx));
+
+                        // Compare
+                        svbool_t vMatch = svcmpeq_s64(pg, vStored, vInput);
+
+                        // Check if all match
+                        if (!svptest_any(pg, svnot_b_z(pg, vMatch))) {
+                            i += activeCount;
+                            continue;
+                        }
+
+                        // Some don't match — extract and swap-to-front
+                        svuint64_t vMatchFlag = svsel_u64(vMatch, svdup_n_u64(1), svdup_n_u64(0));
+                        uint64_t matchFlags[32];
+                        svst1_u64(pg, matchFlags, vMatchFlag);
+                        for (int32_t j = 0; j < activeCount; j++) {
+                            if (matchFlags[j] == 0) {
+                                std::swap(workingUpdateIndices[i + j], workingUpdateIndices[idxFrom]);
+                                idxFrom++;
+                            }
+                        }
+                        i += activeCount;
+                    }
+                }
+#elif defined(__aarch64__)
                 {
                     int32_t i = idxFrom;
                     while (i + 2 <= count) {
