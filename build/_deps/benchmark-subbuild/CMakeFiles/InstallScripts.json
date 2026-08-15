@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/ziruiliu/OmniOperator/cpp-taper-bench/build/_deps/benchmark-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

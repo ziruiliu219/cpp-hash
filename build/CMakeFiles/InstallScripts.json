@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/ziruiliu/OmniOperator/cpp-taper-bench/build/cmake_install.cmake",
+		"/Users/ziruiliu/OmniOperator/cpp-taper-bench/build/_deps/benchmark-build/cmake_install.cmake",
+		"/Users/ziruiliu/OmniOperator/cpp-taper-bench/build/_deps/benchmark-build/src/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
