@@ -136,6 +136,18 @@ public:
         const std::vector<ColumnInput>& columns, const int64_t* aggValues)
     {
         if (rowsNum <= 0) return;
+
+        // Ensure hash table capacity >= numRows before EmplaceBatch
+        // (matches OmniOperator production: table is pre-sized for expected cardinality)
+        while (table->Capacity() < static_cast<size_t>(rowsNum)) {
+            // Force expand by inserting nothing — just trigger the resize
+            // Simpler: just recreate with larger capacity
+            size_t newCap = table->Capacity() * 2 / 8; // chunks needed
+            if (newCap == 0) newCap = 1;
+            while (newCap * 8 < static_cast<size_t>(rowsNum)) newCap *= 2;
+            table = std::make_unique<HashTable>(newCap);
+        }
+
         int32_t groupColNum = static_cast<int32_t>(colDescs_.size());
 
         groups.resize(rowsNum, nullptr);
