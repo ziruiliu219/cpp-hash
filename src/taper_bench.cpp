@@ -65,7 +65,7 @@ static std::vector<Cfg> MkCfg(){
     std::vector<Cfg> r;
     struct KT{const char*n;size_t s,i;};
     KT kts[]={{"4str_0int",4,0},{"3str_1int",3,1},{"2str_2int",2,2},{"1str_3int",1,3},{"0str_4int",0,4}};
-    for(auto&kt:kts)for(auto ht:{16384,65536,262144})for(auto lf:{0.5,0.75})for(auto sel:{0.1,0.5,0.9})
+    for(auto&kt:kts)for(auto ht:{16384,65536,262144,1048576})for(auto lf:{0.5,0.75})for(auto sel:{0.1,0.3,0.5,0.7,0.9})
         r.push_back({kt.n,kt.s,kt.i,(size_t)ht,lf,sel});
     return r;
 }
