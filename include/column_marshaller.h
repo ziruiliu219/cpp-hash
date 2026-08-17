@@ -1,6 +1,12 @@
 /**
  * Standalone TaperColumnSerializeHandler — naming aligned with OmniOperator.
  * Target: Linux aarch64.
+ *
+ * Mirrors core/src/operator/hashmap/column_marshaller.h:
+ *   - BatchCompareVarcharDecoded: SVE path for no-null, scalar fallback
+ *   - SveBatchCompareNoNullDecoded<int64_t>: SVE gather compare for int64
+ *   - colToVarcharPos_: O(1) varchar column position lookup
+ *   - GetUnequalsNumWithDecode: dispatches to typed methods, zero encoding branches
  */
 #pragma once
 #include <cstdint>
@@ -30,7 +36,7 @@ struct ColumnInput {
     static ColumnInput MakeVarchar(const uint8_t* const* p, const size_t* l) { ColumnInput c; c.type=ColumnDesc::Varchar; c.vc.ptrs=p; c.vc.lens=l; return c; }
 };
 
-// ─── Varchar helpers (same as OmniOperator) ─────────────────────────
+// ─── Varchar helpers ─────────────────────────────────────────────────────────
 
 inline uint8_t ComputeRowLenSize(size_t len) { return len<=0xFF?1:len<=0xFFFF?2:4; }
 
@@ -48,6 +54,7 @@ inline size_t ComputeVarCharSerializedSize(const uint8_t* data) {
     return 1+rowLenSize+stringLen;
 }
 
+/// Mirrors OmniOperator CompareVarcharFromRow — NEON accelerated on aarch64.
 inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, size_t inputLen) {
     uint8_t rowLenSize = *rowData; if(!rowLenSize) return false;
     size_t stringLen=0;
@@ -71,7 +78,8 @@ inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, 
 #endif
 }
 
-// ─── SetRowPtr / GetRowPtr — same as OmniOperator ──────────────────
+// ─── SetRowPtr / GetRowPtr ────────────────────────────────────────────────────
+// ROW_PTR_SIZE = 6 is defined in taper_hashtable.h
 
 static inline void SetRowPtr(char* buf, uint8_t* ptr) {
     uint64_t val = reinterpret_cast<uint64_t>(ptr);
@@ -85,7 +93,7 @@ static inline uint8_t* GetRowPtr(const char* buf) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TaperColumnSerializeHandler — naming matches OmniOperator
+// TaperColumnSerializeHandler
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class TaperColumnSerializeHandler {
@@ -104,6 +112,8 @@ public:
     int32_t varcharSlotColIdx = -1;
     std::vector<const uint8_t*> mergedVarcharCache_;
     int32_t mergedVarcharCacheCount_ = 0;
+    /// Mirrors OmniOperator colToVarcharPos_: O(1) map from column index → position in varcharColIndices.
+    std::vector<int32_t> colToVarcharPos_;
     std::vector<uint8_t*> groups;
 
     TaperColumnSerializeHandler(SimpleArenaAllocator& pool, int32_t aggStatesSize,
@@ -128,24 +138,24 @@ public:
         if (varcharColIndices.size() > 1) {
             varcharSlotColIdx = varcharColIndices[0];
         }
+        // Build colToVarcharPos_ — mirrors OmniOperator colToVarcharPos_.assign(groupColNum, -1)
+        colToVarcharPos_.assign(static_cast<int32_t>(colDescs.size()), -1);
+        for (int32_t v = 0; v < static_cast<int32_t>(varcharColIndices.size()); ++v) {
+            colToVarcharPos_[varcharColIndices[v]] = v;
+        }
         aggRows = std::make_unique<RowContainer>(keySizes, kinds, aggStatesSize, pool);
     }
 
     int32_t AggStateOffset() const { return aggRows->AggStateOffset(); }
     size_t NumGroups() const { return aggRows->NumRows(); }
 
-    /// EmplaceTableWithDecode — exact 5-step pipeline matching OmniOperator.
     void EmplaceTableWithDecode(const int64_t* hashes, int32_t rowsNum,
         const std::vector<ColumnInput>& columns, const int64_t* aggValues)
     {
         if (rowsNum <= 0) return;
 
-        // Ensure hash table capacity >= numRows before EmplaceBatch
-        // (matches OmniOperator production: table is pre-sized for expected cardinality)
         while (table->Capacity() < static_cast<size_t>(rowsNum)) {
-            // Force expand by inserting nothing — just trigger the resize
-            // Simpler: just recreate with larger capacity
-            size_t newCap = table->Capacity() * 2 / 8; // chunks needed
+            size_t newCap = table->Capacity() * 2 / 8;
             if (newCap == 0) newCap = 1;
             while (newCap * 8 < static_cast<size_t>(rowsNum)) newCap *= 2;
             table = std::make_unique<HashTable>(newCap);
@@ -162,7 +172,6 @@ public:
         workingUpdateIndices.resize(rowsNum);
         workingUpdateCount = 0;
 
-        // ─── Step 2: EmplaceBatch ───────────────────────────────
         auto initRow = [&](uint32_t rowIdx, char* data) -> char* {
             auto* row = aggRows->NewRow();
             SetRowPtr(data, reinterpret_cast<uint8_t*>(row));
@@ -171,6 +180,7 @@ public:
             return row;
         };
 
+        // Step 2: EmplaceBatch
         table->EmplaceBatch(hashes, rowsNum,
             [](int32_t) { return false; },
             [&](uint32_t rowIdx, char* data) { initRow(rowIdx, data); },
@@ -182,15 +192,11 @@ public:
             }
         );
 
-        // ─── Step 3: Store keys for new groups ──────────────────
-        // Same structure as OmniOperator:
-        // 1. BatchStoreMergedVarcharColumns (all new groups, merged varchar)
-        // 2. Per-column loop for remaining types
+        // Step 3: Store keys for new groups
         int32_t aggOffset = AggStateOffset();
         size_t newGroupsStartIdx = 0;
 
         if (newGroupCount > 0) {
-            // Store merged VARCHAR columns first (all in one contiguous block per row)
             if (varcharColIndices.size() > 1) {
                 BatchStoreMergedVarcharColumns(columns,
                     newGroups.data() + newGroupsStartIdx,
@@ -215,7 +221,6 @@ public:
                 }
             }
 
-            // Store agg values
             for (int32_t i = 0; i < newGroupCount; i++) {
                 char* row = reinterpret_cast<char*>(newGroups[newGroupsStartIdx + i]);
                 uint32_t rowIdx = newGroupRowIndices[i];
@@ -224,12 +229,12 @@ public:
         }
 
         if (workingUpdateCount == 0) return;
-        int32_t count = workingUpdateCount;
 
-        // ─── Step 4: GetUnequalsNumWithDecode ───────────────────
+        // Step 4: GetUnequalsNumWithDecode
+        int32_t count = workingUpdateCount;
         int32_t unequalsNum = GetUnequalsNumWithDecode(count, groupColNum, columns);
 
-        // ─── Step 5: Scalar fallback (unequal rows) ─────────────
+        // Step 5: re-emplace collisions
         for (int32_t ui = 0; ui < unequalsNum; ui++) {
             int32_t rowIdx = workingUpdateIndices[ui];
             int64_t hash = hashes[rowIdx];
@@ -255,7 +260,7 @@ public:
             );
         }
 
-        // Accumulate for confirmed equal rows
+        // Accumulate agg for confirmed-equal rows
         for (int32_t ui = unequalsNum; ui < count; ui++) {
             int32_t rowIdx = workingUpdateIndices[ui];
             auto* rp = groups[rowIdx];
@@ -266,12 +271,103 @@ public:
 private:
     std::vector<ColumnDesc> colDescs_;
 
-    /// GetUnequalsNumWithDecode — batch compare existing groups against input (Step 4).
-    /// Returns number of unequal rows (swapped to front of workingUpdateIndices).
+    // ─── SVE batch compare helpers ───────────────────────────────────────────
+
+#if defined(__ARM_FEATURE_SVE)
+    /// Mirrors OmniOperator SveBatchCompareNoNullDecoded<int64_t>.
+    /// SVE gather-load: load row pointers and stored values in parallel, compare, swap mismatches.
+    void SveBatchCompareInt64NoNull(int32_t count, int32_t offset,
+                                    const int64_t* inputValues,
+                                    int32_t* indices, int32_t& idxFrom)
+    {
+        svbool_t pgAll = svptrue_b64();
+        int32_t i = idxFrom;
+        while (i < count) {
+            svbool_t pg = svwhilelt_b64_s32(i, count);
+            int32_t activeCount = static_cast<int32_t>(svcntp_b64(pgAll, pg));
+
+            // Load indices as u64 (sign-extend from i32)
+            svuint64_t vIdx = svld1sw_u64(pg, &indices[i]);
+
+            // Gather row pointers: groups[idx]
+            svuint64_t vPtrOffsets = svlsl_n_u64_x(pg, vIdx, 3); // idx * sizeof(ptr)
+            svuint64_t vRowPtrs = svld1_gather_u64offset_u64(
+                pg, reinterpret_cast<const uint64_t*>(groups.data()), vPtrOffsets);
+
+            // Gather stored values: *(rowPtr + offset)
+            svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, static_cast<uint64_t>(offset));
+            svint64_t vStored = svld1_gather_u64base_s64(pg, vValueAddr);
+
+            // Gather input values: inputValues[idx]
+            svint64_t vInput = svld1_gather_s64index_s64(
+                pg, inputValues, svreinterpret_s64_u64(vIdx));
+
+            svbool_t vMatch = svcmpeq_s64(pg, vStored, vInput);
+
+            if (!svptest_any(pg, svnot_b_z(pg, vMatch))) {
+                i += activeCount;
+                continue;
+            }
+
+            // Extract mismatch flags and swap-to-front
+            svuint64_t vMatchFlag = svsel_u64(vMatch, svdup_n_u64(1), svdup_n_u64(0));
+            uint64_t matchFlags[32];
+            svst1_u64(pg, matchFlags, vMatchFlag);
+
+            for (int32_t j = 0; j < activeCount; j++) {
+                if (matchFlags[j] == 0) {
+                    std::swap(indices[i + j], indices[idxFrom]);
+                    idxFrom++;
+                }
+            }
+            i += activeCount;
+        }
+    }
+#endif
+
+    // ─── BatchCompareVarcharDecoded ──────────────────────────────────────────
+
+    /// Mirrors OmniOperator BatchCompareVarcharDecoded<HasNull=false> flat path.
+    /// Uses mergedVarcharCache_ for multi-varchar columns (O(1) lookup via colToVarcharPos_).
+    /// No SVE for varchar (string length is variable — scalar is correct baseline).
+    void BatchCompareVarcharDecodedNoNull(int32_t colIdx, int32_t count, int32_t offset,
+                                          const uint8_t* const* inputPtrs,
+                                          const size_t* inputLens,
+                                          int32_t* indices, int32_t& idxFrom)
+    {
+        auto getArenaPtr = [&](int32_t idx) -> const uint8_t* {
+            if (!mergedVarcharCache_.empty()) {
+                // Mirrors OmniOperator: mergedVarcharCache_[groupIdx * mergedVarcharCacheCount_ + vcPos]
+                int32_t vcPos = colToVarcharPos_[colIdx];
+                return mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_ + vcPos];
+            }
+            // Single varchar: read pointer directly from row slot
+            const uint8_t* arenaPtr;
+            memcpy(&arenaPtr,
+                   reinterpret_cast<const char*>(groups[idx]) + offset,
+                   sizeof(arenaPtr));
+            return arenaPtr;
+        };
+
+        for (int32_t i = idxFrom; i < count; i++) {
+            int32_t idx = indices[i];
+            const uint8_t* arenaPtr = getArenaPtr(idx);
+            if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, inputPtrs[idx], inputLens[idx])) {
+                std::swap(indices[i], indices[idxFrom]);
+                idxFrom++;
+            }
+        }
+    }
+
+    // ─── GetUnequalsNumWithDecode ────────────────────────────────────────────
+
+    /// Mirrors OmniOperator GetUnequalsNumWithDecode:
+    ///   1. Build mergedVarcharCache_ once for all rows in workingUpdateIndices
+    ///   2. Per-column loop: dispatch to SVE (int64) or scalar varchar compare
     int32_t GetUnequalsNumWithDecode(int32_t count, int32_t groupColNum,
                                      const std::vector<ColumnInput>& columns)
     {
-        // Build merged varchar cache
+        // Build merged varchar cache — mirrors OmniOperator preamble
         mergedVarcharCache_.clear();
         mergedVarcharCacheCount_ = 0;
         if (varcharColIndices.size() > 1) {
@@ -279,125 +375,85 @@ private:
             int32_t maxIdx = 0;
             for (int32_t w = 0; w < count; w++)
                 maxIdx = std::max(maxIdx, workingUpdateIndices[w]);
-            mergedVarcharCache_.resize((maxIdx + 1) * mergedVarcharCacheCount_, nullptr);
+            mergedVarcharCache_.resize(
+                static_cast<size_t>(maxIdx + 1) * mergedVarcharCacheCount_, nullptr);
             for (int32_t w = 0; w < count; w++) {
                 int32_t idx = workingUpdateIndices[w];
                 GetAllMergedVarcharPtrs(
                     reinterpret_cast<const char*>(groups[idx]),
-                    &mergedVarcharCache_[idx * mergedVarcharCacheCount_],
+                    &mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_],
                     mergedVarcharCacheCount_);
             }
         }
 
         int32_t idxFrom = 0;
-        for (int32_t groupColIdx = 0; groupColIdx < groupColNum && idxFrom < count; groupColIdx++) {
-            auto col = aggRows->ColumnAt(groupColIdx);
+        for (int32_t colIdx = 0; colIdx < groupColNum && idxFrom < count; colIdx++) {
+            auto col = aggRows->ColumnAt(colIdx);
             int32_t offset = col.Offset();
 
-            if (colDescs_[groupColIdx] == ColumnDesc::Int64) {
-                const int64_t* inputValues = columns[groupColIdx].int64Data;
+            if (colDescs_[colIdx] == ColumnDesc::Int64) {
+                const int64_t* inputValues = columns[colIdx].int64Data;
+
 #if defined(__ARM_FEATURE_SVE)
-                // SVE batch compare — matches OmniOperator SveBatchCompareNoNullDecoded<int64_t>
-                {
-                    svbool_t pgAll = svptrue_b64();
-                    int32_t i = idxFrom;
-                    while (i < count) {
-                        svbool_t pg = svwhilelt_b64_s32(i, count);
-                        int32_t activeCount = (int32_t)svcntp_b64(pgAll, pg);
-
-                        // Load indices
-                        svuint64_t vIdx = svld1sw_u64(pg, &workingUpdateIndices[i]);
-
-                        // Gather row pointers: groups[idx]
-                        svuint64_t vPtrOffsets = svlsl_n_u64_x(pg, vIdx, 3); // idx * 8
-                        svuint64_t vRowPtrs = svld1_gather_u64offset_u64(pg, reinterpret_cast<const uint64_t*>(groups.data()), vPtrOffsets);
-
-                        // Gather stored values: *(rowPtr + offset)
-                        svint64_t vStored = svld1_gather_s64offset_s64(pg, reinterpret_cast<const int64_t*>(0),
-                            svreinterpret_s64_u64(svadd_n_u64_x(pg, vRowPtrs, static_cast<uint64_t>(offset))));
-
-                        // Gather input values: inputValues[idx]
-                        svint64_t vInput = svld1_gather_s64index_s64(pg, inputValues, svreinterpret_s64_u64(vIdx));
-
-                        // Compare
-                        svbool_t vMatch = svcmpeq_s64(pg, vStored, vInput);
-
-                        // Check if all match
-                        if (!svptest_any(pg, svnot_b_z(pg, vMatch))) {
-                            i += activeCount;
-                            continue;
-                        }
-
-                        // Some don't match — extract and swap-to-front
-                        svuint64_t vMatchFlag = svsel_u64(vMatch, svdup_n_u64(1), svdup_n_u64(0));
-                        uint64_t matchFlags[32];
-                        svst1_u64(pg, matchFlags, vMatchFlag);
-                        for (int32_t j = 0; j < activeCount; j++) {
-                            if (matchFlags[j] == 0) {
-                                std::swap(workingUpdateIndices[i + j], workingUpdateIndices[idxFrom]);
-                                idxFrom++;
-                            }
-                        }
-                        i += activeCount;
-                    }
-                }
+                // Mirrors OmniOperator SveBatchCompareNoNullDecoded<int64_t>
+                SveBatchCompareInt64NoNull(count, offset, inputValues,
+                                           workingUpdateIndices.data(), idxFrom);
 #elif defined(__aarch64__)
+                // NEON fallback: 2×i64 per iteration
                 {
                     int32_t i = idxFrom;
                     while (i + 2 <= count) {
                         int32_t idx0 = workingUpdateIndices[i], idx1 = workingUpdateIndices[i+1];
-                        int64_t s0 = RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups[idx0]), offset);
-                        int64_t s1 = RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups[idx1]), offset);
-                        int64x2_t vStored = vcombine_s64(vcreate_s64(static_cast<uint64_t>(s0)), vcreate_s64(static_cast<uint64_t>(s1)));
-                        int64x2_t vInput = vcombine_s64(vcreate_s64(static_cast<uint64_t>(inputValues[idx0])), vcreate_s64(static_cast<uint64_t>(inputValues[idx1])));
+                        int64_t s0 = RowContainer::ReadValue<int64_t>(
+                            reinterpret_cast<const char*>(groups[idx0]), offset);
+                        int64_t s1 = RowContainer::ReadValue<int64_t>(
+                            reinterpret_cast<const char*>(groups[idx1]), offset);
+                        int64x2_t vStored = vcombine_s64(
+                            vcreate_s64(static_cast<uint64_t>(s0)),
+                            vcreate_s64(static_cast<uint64_t>(s1)));
+                        int64x2_t vInput = vcombine_s64(
+                            vcreate_s64(static_cast<uint64_t>(inputValues[idx0])),
+                            vcreate_s64(static_cast<uint64_t>(inputValues[idx1])));
                         uint64x2_t cmp = vceqq_s64(vStored, vInput);
-                        if (vgetq_lane_u64(cmp, 0) == 0) { std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++; }
-                        if (vgetq_lane_u64(cmp, 1) == 0) { std::swap(workingUpdateIndices[i+1], workingUpdateIndices[idxFrom]); idxFrom++; }
+                        if (vgetq_lane_u64(cmp, 0) == 0) {
+                            std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++;
+                        }
+                        if (vgetq_lane_u64(cmp, 1) == 0) {
+                            std::swap(workingUpdateIndices[i+1], workingUpdateIndices[idxFrom]); idxFrom++;
+                        }
                         i += 2;
                     }
                     for (; i < count; i++) {
                         int32_t idx = workingUpdateIndices[i];
-                        if (RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups[idx]), offset) != inputValues[idx])
-                            { std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++; }
+                        if (RowContainer::ReadValue<int64_t>(
+                                reinterpret_cast<const char*>(groups[idx]), offset) != inputValues[idx]) {
+                            std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++;
+                        }
                     }
                 }
 #else
                 for (int32_t i = idxFrom; i < count; i++) {
                     int32_t idx = workingUpdateIndices[i];
-                    if (RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups[idx]), offset) != inputValues[idx])
-                        { std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++; }
+                    if (RowContainer::ReadValue<int64_t>(
+                            reinterpret_cast<const char*>(groups[idx]), offset) != inputValues[idx]) {
+                        std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++;
+                    }
                 }
 #endif
             } else {
-                // VARCHAR column
-                auto* inputPtrs = columns[groupColIdx].vc.ptrs;
-                auto* inputLens = columns[groupColIdx].vc.lens;
-                if (varcharColIndices.size() > 1) {
-                    int32_t vcPos = 0;
-                    for (int32_t v = 0; v < static_cast<int32_t>(varcharColIndices.size()); v++)
-                        if (varcharColIndices[v] == groupColIdx) { vcPos = v; break; }
-                    for (int32_t i = idxFrom; i < count; i++) {
-                        int32_t idx = workingUpdateIndices[i];
-                        auto* arenaPtr = mergedVarcharCache_[idx * mergedVarcharCacheCount_ + vcPos];
-                        if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, inputPtrs[idx], inputLens[idx]))
-                            { std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++; }
-                    }
-                } else {
-                    for (int32_t i = idxFrom; i < count; i++) {
-                        int32_t idx = workingUpdateIndices[i];
-                        const uint8_t* arenaPtr;
-                        memcpy(&arenaPtr, reinterpret_cast<const char*>(groups[idx]) + offset, sizeof(arenaPtr));
-                        if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, inputPtrs[idx], inputLens[idx]))
-                            { std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++; }
-                    }
-                }
+                // VARCHAR — mirrors OmniOperator GetUnequalsNumVarcharTyped<HasNull=false>
+                // which calls BatchCompareVarcharDecoded<false>
+                BatchCompareVarcharDecodedNoNull(
+                    colIdx, count, offset,
+                    columns[colIdx].vc.ptrs, columns[colIdx].vc.lens,
+                    workingUpdateIndices.data(), idxFrom);
             }
         }
         return idxFrom;
     }
 
-    /// BatchStoreMergedVarcharColumns — batch store merged varchar for all new groups.
-    /// Same as OmniOperator: iterates new groups, serializes all varchar columns into one arena block per row.
+    // ─── Key store helpers ───────────────────────────────────────────────────
+
     void BatchStoreMergedVarcharColumns(const std::vector<ColumnInput>& columns,
                                         uint8_t** rows, uint32_t* rowIndices, int32_t rowCount)
     {
@@ -406,21 +462,24 @@ private:
             uint32_t rowIdx = rowIndices[i];
             size_t totalSize = 0;
             for (auto vcIdx : varcharColIndices) {
-                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vc.lens[rowIdx]) + columns[vcIdx].vc.lens[rowIdx];
+                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vc.lens[rowIdx])
+                               + columns[vcIdx].vc.lens[rowIdx];
             }
             uint8_t* blockStart = aggRows->ArenaAlloc(totalSize);
             uint8_t* writePos = blockStart;
             for (auto vcIdx : varcharColIndices) {
                 auto col = aggRows->ColumnAt(vcIdx);
                 RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
-                writePos += SerializeVarcharToBuffer(writePos, columns[vcIdx].vc.ptrs[rowIdx], columns[vcIdx].vc.lens[rowIdx]);
+                writePos += SerializeVarcharToBuffer(
+                    writePos,
+                    columns[vcIdx].vc.ptrs[rowIdx],
+                    columns[vcIdx].vc.lens[rowIdx]);
             }
             auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
             memcpy(row + slotCol.Offset(), &blockStart, sizeof(blockStart));
         }
     }
 
-    /// BatchStoreKeyColumnVarcharTyped — batch store single varchar column for new groups.
     void BatchStoreKeyColumnVarcharTyped(int32_t colIdx, int32_t offset, uint32_t nullByte, uint8_t nullMask,
                                          uint8_t** rows, uint32_t* rowIndices, int32_t rowCount,
                                          const std::vector<ColumnInput>& columns)
@@ -437,7 +496,6 @@ private:
         }
     }
 
-    /// BatchStoreKeyColumnTyped — batch store fixed-width (int64) column for new groups.
     void BatchStoreKeyColumnTyped(int32_t colIdx, int32_t offset, uint32_t nullByte, uint8_t nullMask,
                                   uint8_t** rows, uint32_t* rowIndices, int32_t rowCount,
                                   const std::vector<ColumnInput>& columns)
@@ -450,23 +508,24 @@ private:
         }
     }
 
-    /// StoreKeyOneRowFromDecode — store all key columns for one row (used by Step 5 scalar fallback).
     void StoreKeyOneRowFromDecode(char* row, int32_t rowIdx,
         const std::vector<ColumnInput>& columns, int32_t groupColNum)
     {
         if (varcharColIndices.size() > 1) {
-            // Merged varchar: serialize all varchar columns into one arena block
             size_t totalSize = 0;
             for (auto vcIdx : varcharColIndices)
-                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vc.lens[rowIdx]) + columns[vcIdx].vc.lens[rowIdx];
+                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vc.lens[rowIdx])
+                               + columns[vcIdx].vc.lens[rowIdx];
             uint8_t* blockStart = aggRows->ArenaAlloc(totalSize);
             uint8_t* writePos = blockStart;
             for (auto vcIdx : varcharColIndices) {
                 auto col = aggRows->ColumnAt(vcIdx);
                 RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
-                writePos += SerializeVarcharToBuffer(writePos, columns[vcIdx].vc.ptrs[rowIdx], columns[vcIdx].vc.lens[rowIdx]);
+                writePos += SerializeVarcharToBuffer(
+                    writePos,
+                    columns[vcIdx].vc.ptrs[rowIdx],
+                    columns[vcIdx].vc.lens[rowIdx]);
             }
-            // Store merged block pointer in slot column
             auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
             memcpy(row + slotCol.Offset(), &blockStart, sizeof(blockStart));
         } else if (varcharColIndices.size() == 1) {
@@ -479,7 +538,6 @@ private:
             SerializeVarcharToBuffer(arenaPtr, columns[vcIdx].vc.ptrs[rowIdx], len);
             memcpy(row + col.Offset(), &arenaPtr, sizeof(arenaPtr));
         }
-        // Store int64 columns
         for (int32_t colIdx = 0; colIdx < groupColNum; colIdx++) {
             if (colDescs_[colIdx] == ColumnDesc::Int64) {
                 auto col = aggRows->ColumnAt(colIdx);
@@ -489,7 +547,9 @@ private:
         }
     }
 
-    /// GetAllMergedVarcharPtrs — fill pointers to each varchar in the merged block.
+    // ─── Merged varchar pointer helpers ─────────────────────────────────────
+
+    /// Mirrors OmniOperator GetAllMergedVarcharPtrs.
     void GetAllMergedVarcharPtrs(const char* row, const uint8_t** outPtrs, int32_t maxCount) const {
         auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
         const uint8_t* blockPtr;
@@ -507,19 +567,24 @@ private:
         }
     }
 
-    /// CompareKeysWithDecode — compare all key columns in a row against input.
+    // ─── Single-row key compare (step 5 scalar fallback) ────────────────────
+
     bool CompareKeysWithDecode(const char* row, int32_t rowIdx,
         const std::vector<ColumnInput>& columns, int32_t groupColNum) const
     {
         for (int32_t colIdx = 0; colIdx < groupColNum; colIdx++) {
             auto col = aggRows->ColumnAt(colIdx);
             if (colDescs_[colIdx] == ColumnDesc::Int64) {
-                if (RowContainer::ReadValue<int64_t>(row, col.Offset()) != columns[colIdx].int64Data[rowIdx])
+                if (RowContainer::ReadValue<int64_t>(row, col.Offset())
+                        != columns[colIdx].int64Data[rowIdx])
                     return false;
             } else {
                 const uint8_t* arenaPtr;
                 memcpy(&arenaPtr, row + col.Offset(), sizeof(arenaPtr));
-                if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, columns[colIdx].vc.ptrs[rowIdx], columns[colIdx].vc.lens[rowIdx]))
+                if (!arenaPtr || !CompareVarcharFromRow(
+                        arenaPtr,
+                        columns[colIdx].vc.ptrs[rowIdx],
+                        columns[colIdx].vc.lens[rowIdx]))
                     return false;
             }
         }
