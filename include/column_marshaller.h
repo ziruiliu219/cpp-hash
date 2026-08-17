@@ -54,7 +54,8 @@ inline size_t ComputeVarCharSerializedSize(const uint8_t* data) {
     return 1+rowLenSize+stringLen;
 }
 
-/// Mirrors OmniOperator CompareVarcharFromRow — NEON accelerated on aarch64.
+/// Mirrors OmniOperator CompareVarcharFromRow:
+///   return memcmp(rowDataPtr, sv.data(), stringLen) == 0;
 inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, size_t inputLen) {
     uint8_t rowLenSize = *rowData; if(!rowLenSize) return false;
     size_t stringLen=0;
@@ -62,20 +63,7 @@ inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, 
     if (stringLen!=inputLen) return false;
     if (stringLen==0) return true;
     const uint8_t* ptr = rowData+1+rowLenSize;
-#if defined(__aarch64__)
-    size_t i=0;
-    for (; i+16<=stringLen; i+=16) {
-        uint8x16_t lhs = vld1q_u8(ptr+i);
-        uint8x16_t rhs = vld1q_u8(input+i);
-        uint8x16_t cmp = vceqq_u8(lhs, rhs);
-        uint64x2_t wide = vreinterpretq_u64_u8(cmp);
-        if (vgetq_lane_u64(wide,0)!=~0ULL || vgetq_lane_u64(wide,1)!=~0ULL) return false;
-    }
-    for (; i<stringLen; i++) { if (ptr[i]!=input[i]) return false; }
-    return true;
-#else
     return memcmp(ptr, input, stringLen)==0;
-#endif
 }
 
 // ─── SetRowPtr / GetRowPtr ────────────────────────────────────────────────────
