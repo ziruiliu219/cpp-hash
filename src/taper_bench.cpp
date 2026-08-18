@@ -54,7 +54,9 @@ BenchData GenData(size_t nStr,size_t nInt,size_t nKeys,size_t nProbe,double sel,
 static void RunTaper(const BenchData& d, size_t ht) {
     taper::SimpleArenaAllocator pool;
     std::vector<taper::ColumnDesc> cd; for(size_t c=0;c<d.nStr;c++)cd.push_back(taper::ColumnDesc::Varchar); for(size_t c=0;c<d.nInt;c++)cd.push_back(taper::ColumnDesc::Int64);
-    taper::TaperColumnSerializeHandler t(pool, 8, cd, ht);
+    // Pre-allocate: distinct_keys / 0.85 / 8 chunks, power-of-2 (same as Rust bench)
+    size_t initChunks = ht;
+    taper::TaperColumnSerializeHandler t(pool, 8, cd, initChunks);
     std::vector<taper::ColumnInput> cols; for(size_t c=0;c<d.nStr;c++)cols.push_back(taper::ColumnInput::MakeVarchar(d.strPtrs[c].data(),d.strLens[c].data()));for(size_t c=0;c<d.nInt;c++)cols.push_back(taper::ColumnInput::MakeInt64(d.intCols[c].data()));
     t.EmplaceTableWithDecode(d.hashes.data(),int32_t(d.totalRows),cols,d.values.data());
     benchmark::DoNotOptimize(t.NumGroups());
@@ -78,7 +80,17 @@ static const BenchData& GetData(size_t idx){
     return dataCache[idx];
 }
 
-static void BM_Taper(benchmark::State& st){auto cfgs=MkCfg();auto&c=cfgs[st.range(0)];auto&d=GetData(st.range(0));for(auto _:st)RunTaper(d,c.ht);st.SetItemsProcessed(st.iterations()*d.totalRows);}
+static void BM_Taper(benchmark::State& st){
+    auto cfgs=MkCfg();auto&c=cfgs[st.range(0)];auto&d=GetData(st.range(0));
+    // Compute num_chunks same as Rust: distinct_keys / 0.85 / 8, power-of-2
+    size_t numKeys = static_cast<size_t>(c.ht * c.lf);
+    size_t numMisses = 1000000 - static_cast<size_t>(1000000 * c.sel);
+    size_t distinctKeys = numKeys + numMisses;
+    size_t minSlots = std::max(static_cast<size_t>(distinctKeys / 0.85), size_t(8));
+    size_t numChunks = 1; while(numChunks * 8 < minSlots) numChunks *= 2;
+    for(auto _:st)RunTaper(d,numChunks);
+    st.SetItemsProcessed(st.iterations()*d.totalRows);
+}
 
 int main(int argc,char**argv){
     auto cfgs=MkCfg();

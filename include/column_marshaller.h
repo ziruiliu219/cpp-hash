@@ -142,12 +142,9 @@ public:
     {
         if (rowsNum <= 0) return;
 
-        while (table->Capacity() < static_cast<size_t>(rowsNum)) {
-            size_t newCap = table->Capacity() * 2 / 8;
-            if (newCap == 0) newCap = 1;
-            while (newCap * 8 < static_cast<size_t>(rowsNum)) newCap *= 2;
-            table = std::make_unique<HashTable>(newCap);
-        }
+        // No capacity check here — caller must pass sufficient initCap
+        // to constructor so that no rehash occurs.
+        // This matches Rust: TaperColumnSerializeHandler::new(&col_descs, 8, num_chunks)
 
         int32_t groupColNum = static_cast<int32_t>(colDescs_.size());
 
