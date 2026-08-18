@@ -51,14 +51,28 @@ BenchData GenData(size_t nStr,size_t nInt,size_t nKeys,size_t nProbe,double sel,
     return d;
 }
 
-static void RunTaper(const BenchData& d, size_t ht) {
+static void RunTaper(const BenchData& d, size_t numChunks) {
+    constexpr size_t BATCH_SIZE = 410;
     taper::SimpleArenaAllocator pool;
     std::vector<taper::ColumnDesc> cd; for(size_t c=0;c<d.nStr;c++)cd.push_back(taper::ColumnDesc::Varchar); for(size_t c=0;c<d.nInt;c++)cd.push_back(taper::ColumnDesc::Int64);
-    // Pre-allocate: distinct_keys / 0.85 / 8 chunks, power-of-2 (same as Rust bench)
-    size_t initChunks = ht;
-    taper::TaperColumnSerializeHandler t(pool, 8, cd, initChunks);
-    std::vector<taper::ColumnInput> cols; for(size_t c=0;c<d.nStr;c++)cols.push_back(taper::ColumnInput::MakeVarchar(d.strPtrs[c].data(),d.strLens[c].data()));for(size_t c=0;c<d.nInt;c++)cols.push_back(taper::ColumnInput::MakeInt64(d.intCols[c].data()));
-    t.EmplaceTableWithDecode(d.hashes.data(),int32_t(d.totalRows),cols,d.values.data());
+    taper::TaperColumnSerializeHandler t(pool, 8, cd, numChunks);
+
+    size_t totalRows = d.totalRows;
+    size_t numBatches = (totalRows + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    for (size_t batch = 0; batch < numBatches; batch++) {
+        size_t start = batch * BATCH_SIZE;
+        size_t end = std::min(start + BATCH_SIZE, totalRows);
+        int32_t batchLen = static_cast<int32_t>(end - start);
+
+        std::vector<taper::ColumnInput> cols;
+        for (size_t c = 0; c < d.nStr; c++)
+            cols.push_back(taper::ColumnInput::MakeVarchar(d.strPtrs[c].data() + start, d.strLens[c].data() + start));
+        for (size_t c = 0; c < d.nInt; c++)
+            cols.push_back(taper::ColumnInput::MakeInt64(d.intCols[c].data() + start));
+
+        t.EmplaceTableWithDecode(d.hashes.data() + start, batchLen, cols, d.values.data() + start);
+    }
     benchmark::DoNotOptimize(t.NumGroups());
 }
 
