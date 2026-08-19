@@ -15,12 +15,6 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#endif
-#if defined(__ARM_FEATURE_SVE)
-#include <arm_sve.h>
-#endif
 #include "taper_hashtable.h"
 #include "row_container.h"
 #include "simple_arena_allocator.h"
@@ -142,33 +136,23 @@ public:
     {
         if (rowsNum <= 0) return;
 
-        // No capacity check here — caller must pass sufficient initCap
-        // to constructor so that no rehash occurs.
-        // This matches Rust: TaperColumnSerializeHandler::new(&col_descs, 8, num_chunks)
-
         int32_t groupColNum = static_cast<int32_t>(colDescs_.size());
+        int32_t aggOffset = AggStateOffset();
 
         groups.resize(rowsNum, nullptr);
-        std::vector<uint8_t*> newGroups;
-        newGroups.reserve(rowsNum / 4);
-        std::vector<uint32_t> newGroupRowIndices(rowsNum);
-        int32_t newGroupCount = 0;
 
         workingUpdateIndices.resize(rowsNum);
         workingUpdateCount = 0;
 
-        auto initRow = [&](uint32_t rowIdx, char* data) -> char* {
-            auto* row = aggRows->NewRow();
-            SetRowPtr(data, reinterpret_cast<uint8_t*>(row));
-            newGroups.push_back(GetRowPtr(data));
-            newGroupRowIndices[newGroupCount++] = rowIdx;
-            return row;
-        };
-
-        // Step 2: EmplaceBatch
+        // Step 2: EmplaceBatch — store keys immediately in init (matches Rust on_init)
         table->EmplaceBatch(hashes, rowsNum,
             [](int32_t) { return false; },
-            [&](uint32_t rowIdx, char* data) { initRow(rowIdx, data); },
+            [&](uint32_t rowIdx, char* data) {
+                auto* row = aggRows->NewRow();
+                SetRowPtr(data, reinterpret_cast<uint8_t*>(row));
+                StoreKeyOneRowFromDecode(row, rowIdx, columns, groupColNum);
+                RowContainer::StoreValue<int64_t>(row, aggOffset, aggValues[rowIdx]);
+            },
             [&](uint32_t rowIdx, char* data, bool initFlag) {
                 groups[rowIdx] = GetRowPtr(data);
                 if (!initFlag) {
@@ -176,42 +160,6 @@ public:
                 }
             }
         );
-
-        // Step 3: Store keys for new groups
-        int32_t aggOffset = AggStateOffset();
-        size_t newGroupsStartIdx = 0;
-
-        if (newGroupCount > 0) {
-            if (varcharColIndices.size() > 1) {
-                BatchStoreMergedVarcharColumns(columns,
-                    newGroups.data() + newGroupsStartIdx,
-                    newGroupRowIndices.data(), newGroupCount);
-            }
-
-            for (int32_t colIdx = 0; colIdx < groupColNum; colIdx++) {
-                auto col = aggRows->ColumnAt(colIdx);
-                int32_t offset = col.Offset();
-                uint32_t nullByte = col.NullByte();
-                uint8_t nullMask = col.NullMask();
-
-                if (colDescs_[colIdx] == ColumnDesc::Varchar) {
-                    if (varcharColIndices.size() > 1) {
-                        continue; // handled by BatchStoreMergedVarcharColumns
-                    }
-                    BatchStoreKeyColumnVarcharTyped(colIdx, offset, nullByte, nullMask,
-                        newGroups.data() + newGroupsStartIdx, newGroupRowIndices.data(), newGroupCount, columns);
-                } else {
-                    BatchStoreKeyColumnTyped(colIdx, offset, nullByte, nullMask,
-                        newGroups.data() + newGroupsStartIdx, newGroupRowIndices.data(), newGroupCount, columns);
-                }
-            }
-
-            for (int32_t i = 0; i < newGroupCount; i++) {
-                char* row = reinterpret_cast<char*>(newGroups[newGroupsStartIdx + i]);
-                uint32_t rowIdx = newGroupRowIndices[i];
-                RowContainer::StoreValue<int64_t>(row, aggOffset, aggValues[rowIdx]);
-            }
-        }
 
         if (workingUpdateCount == 0) return;
 
@@ -256,65 +204,10 @@ public:
 private:
     std::vector<ColumnDesc> colDescs_;
 
-    // ─── SVE batch compare helpers ───────────────────────────────────────────
+    // ─── BatchCompareVarcharDecoded (scalar, matches Rust) ───────────────────
 
-#if defined(__ARM_FEATURE_SVE)
-    /// Mirrors OmniOperator SveBatchCompareNoNullDecoded<int64_t>.
-    /// SVE gather-load: load row pointers and stored values in parallel, compare, swap mismatches.
-    void SveBatchCompareInt64NoNull(int32_t count, int32_t offset,
-                                    const int64_t* inputValues,
-                                    int32_t* indices, int32_t& idxFrom)
-    {
-        svbool_t pgAll = svptrue_b64();
-        int32_t i = idxFrom;
-        while (i < count) {
-            svbool_t pg = svwhilelt_b64_s32(i, count);
-            int32_t activeCount = static_cast<int32_t>(svcntp_b64(pgAll, pg));
-
-            // Load indices as u64 (sign-extend from i32)
-            svuint64_t vIdx = svld1sw_u64(pg, &indices[i]);
-
-            // Gather row pointers: groups[idx]
-            svuint64_t vPtrOffsets = svlsl_n_u64_x(pg, vIdx, 3); // idx * sizeof(ptr)
-            svuint64_t vRowPtrs = svld1_gather_u64offset_u64(
-                pg, reinterpret_cast<const uint64_t*>(groups.data()), vPtrOffsets);
-
-            // Gather stored values: *(rowPtr + offset)
-            svuint64_t vValueAddr = svadd_n_u64_x(pg, vRowPtrs, static_cast<uint64_t>(offset));
-            svint64_t vStored = svld1_gather_u64base_s64(pg, vValueAddr);
-
-            // Gather input values: inputValues[idx]
-            svint64_t vInput = svld1_gather_s64index_s64(
-                pg, inputValues, svreinterpret_s64_u64(vIdx));
-
-            svbool_t vMatch = svcmpeq_s64(pg, vStored, vInput);
-
-            if (!svptest_any(pg, svnot_b_z(pg, vMatch))) {
-                i += activeCount;
-                continue;
-            }
-
-            // Extract mismatch flags and swap-to-front
-            svuint64_t vMatchFlag = svsel_u64(vMatch, svdup_n_u64(1), svdup_n_u64(0));
-            uint64_t matchFlags[32];
-            svst1_u64(pg, matchFlags, vMatchFlag);
-
-            for (int32_t j = 0; j < activeCount; j++) {
-                if (matchFlags[j] == 0) {
-                    std::swap(indices[i + j], indices[idxFrom]);
-                    idxFrom++;
-                }
-            }
-            i += activeCount;
-        }
-    }
-#endif
-
-    // ─── BatchCompareVarcharDecoded ──────────────────────────────────────────
-
-    /// Mirrors OmniOperator BatchCompareVarcharDecoded<HasNull=false> flat path.
+    /// Mirrors Rust batch_compare_varchar_decoded / batch_compare_varchar_decoded_cached.
     /// Uses mergedVarcharCache_ for multi-varchar columns (O(1) lookup via colToVarcharPos_).
-    /// No SVE for varchar (string length is variable — scalar is correct baseline).
     void BatchCompareVarcharDecodedNoNull(int32_t colIdx, int32_t count, int32_t offset,
                                           const uint8_t* const* inputPtrs,
                                           const size_t* inputLens,
@@ -322,11 +215,9 @@ private:
     {
         auto getArenaPtr = [&](int32_t idx) -> const uint8_t* {
             if (!mergedVarcharCache_.empty()) {
-                // Mirrors OmniOperator: mergedVarcharCache_[groupIdx * mergedVarcharCacheCount_ + vcPos]
                 int32_t vcPos = colToVarcharPos_[colIdx];
                 return mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_ + vcPos];
             }
-            // Single varchar: read pointer directly from row slot
             const uint8_t* arenaPtr;
             memcpy(&arenaPtr,
                    reinterpret_cast<const char*>(groups[idx]) + offset,
@@ -344,15 +235,12 @@ private:
         }
     }
 
-    // ─── GetUnequalsNumWithDecode ────────────────────────────────────────────
+    // ─── GetUnequalsNumWithDecode (scalar only, matches Rust) ────────────────
 
-    /// Mirrors OmniOperator GetUnequalsNumWithDecode:
-    ///   1. Build mergedVarcharCache_ once for all rows in workingUpdateIndices
-    ///   2. Per-column loop: dispatch to SVE (int64) or scalar varchar compare
     int32_t GetUnequalsNumWithDecode(int32_t count, int32_t groupColNum,
                                      const std::vector<ColumnInput>& columns)
     {
-        // Build merged varchar cache — mirrors OmniOperator preamble
+        // Build merged varchar cache
         mergedVarcharCache_.clear();
         mergedVarcharCacheCount_ = 0;
         if (varcharColIndices.size() > 1) {
@@ -378,45 +266,7 @@ private:
 
             if (colDescs_[colIdx] == ColumnDesc::Int64) {
                 const int64_t* inputValues = columns[colIdx].int64Data;
-
-#if defined(__ARM_FEATURE_SVE)
-                // Mirrors OmniOperator SveBatchCompareNoNullDecoded<int64_t>
-                SveBatchCompareInt64NoNull(count, offset, inputValues,
-                                           workingUpdateIndices.data(), idxFrom);
-#elif defined(__aarch64__)
-                // NEON fallback: 2×i64 per iteration
-                {
-                    int32_t i = idxFrom;
-                    while (i + 2 <= count) {
-                        int32_t idx0 = workingUpdateIndices[i], idx1 = workingUpdateIndices[i+1];
-                        int64_t s0 = RowContainer::ReadValue<int64_t>(
-                            reinterpret_cast<const char*>(groups[idx0]), offset);
-                        int64_t s1 = RowContainer::ReadValue<int64_t>(
-                            reinterpret_cast<const char*>(groups[idx1]), offset);
-                        int64x2_t vStored = vcombine_s64(
-                            vcreate_s64(static_cast<uint64_t>(s0)),
-                            vcreate_s64(static_cast<uint64_t>(s1)));
-                        int64x2_t vInput = vcombine_s64(
-                            vcreate_s64(static_cast<uint64_t>(inputValues[idx0])),
-                            vcreate_s64(static_cast<uint64_t>(inputValues[idx1])));
-                        uint64x2_t cmp = vceqq_s64(vStored, vInput);
-                        if (vgetq_lane_u64(cmp, 0) == 0) {
-                            std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++;
-                        }
-                        if (vgetq_lane_u64(cmp, 1) == 0) {
-                            std::swap(workingUpdateIndices[i+1], workingUpdateIndices[idxFrom]); idxFrom++;
-                        }
-                        i += 2;
-                    }
-                    for (; i < count; i++) {
-                        int32_t idx = workingUpdateIndices[i];
-                        if (RowContainer::ReadValue<int64_t>(
-                                reinterpret_cast<const char*>(groups[idx]), offset) != inputValues[idx]) {
-                            std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++;
-                        }
-                    }
-                }
-#else
+                // Scalar only — matches Rust batch_compare_decoded_i64_scalar
                 for (int32_t i = idxFrom; i < count; i++) {
                     int32_t idx = workingUpdateIndices[i];
                     if (RowContainer::ReadValue<int64_t>(
@@ -424,10 +274,7 @@ private:
                         std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++;
                     }
                 }
-#endif
             } else {
-                // VARCHAR — mirrors OmniOperator GetUnequalsNumVarcharTyped<HasNull=false>
-                // which calls BatchCompareVarcharDecoded<false>
                 BatchCompareVarcharDecodedNoNull(
                     colIdx, count, offset,
                     columns[colIdx].vc.ptrs, columns[colIdx].vc.lens,

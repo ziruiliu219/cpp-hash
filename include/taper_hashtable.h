@@ -278,51 +278,79 @@ private:
     void FreeChunks() { if (chunks_) { free(chunks_); chunks_ = nullptr; } }
     uint32_t ExpandLastChunkIdx() const { return 2 * lastChunkIdx_ + 1; }
 
-    // ─── Expand: iterative L1-step rehash ───────────────────────────
+    // ─── Expand: collect-all + batch insert with prefetch (matches Rust) ───
 
-    void ExpandCapacityIteratively() {
+    void ExpandCapacity() {
         auto oldNum = static_cast<size_t>(lastChunkIdx_) + 1;
         auto* oldChunks = chunks_;
-        AllocChunks(ExpandLastChunkIdx());
-        constexpr size_t kL1 = 64 * 1024;
-        constexpr size_t kStep = kL1 / sizeof(TaperHashTableChunk) * 3 / 4;
-        for (size_t from = 0; from < oldNum; from += kStep) {
-            size_t to = std::min(from + kStep, oldNum);
-            RehashRange(oldChunks + from, oldChunks + to);
-        }
-        free(oldChunks);
-    }
-    void ExpandCapacityDirectly() {
-        auto oldNum = static_cast<size_t>(lastChunkIdx_) + 1;
-        auto* oldChunks = chunks_;
-        AllocChunks(ExpandLastChunkIdx());
-        RehashRange(oldChunks, oldChunks + oldNum);
-        free(oldChunks);
-    }
-    void RehashRange(TaperHashTableChunk* from, TaperHashTableChunk* to) {
-        for (auto* c = from; c != to; c++) {
+
+        // Collect all occupied entries from old chunks
+        struct Entry { Key key; char val[ROW_PTR_SIZE]; };
+        std::vector<Entry> entries;
+        entries.reserve(size_);
+        for (size_t ci = 0; ci < oldNum; ci++) {
+            auto* c = oldChunks + ci;
             for (uint8_t s = 0; s < elemNumInChunk_; s++) {
                 if (c->TagsBuf()[s] != kEmptyTag) {
-                    Key key = GetChunkKey(*c, s);
-                    RehashInsertOne(key, ValueBuf(*c, s));
+                    Entry e; e.key = GetChunkKey(*c, s);
+                    memcpy(e.val, ValueBuf(*c, s), valueSize_);
+                    entries.push_back(e);
                 }
             }
         }
-    }
-    void RehashInsertOne(Key key, const char* srcVal) {
-        uint64_t h = Hash(key); ChunkPos pos = GetChunkPos(h); uint8_t tag = (h >> 16) & 0x7F;
-        while (true) {
-            auto* chunk = chunks_ + pos;
-            for (auto it = PHBitMask::MatchEmpty(chunk->GetU64Tags(), emptyTags_); it; ++it) {
-                uint32_t slot = *it;
-                size_++; chunk->TagsBuf()[slot] = tag;
-                SetChunkKey(*chunk, slot, key);
-                memcpy(ValueBuf(*chunk, slot), srcVal, valueSize_);
-                return;
+
+        // Allocate new chunk array (2x)
+        AllocChunks(ExpandLastChunkIdx());
+        free(oldChunks);
+
+        size_t n = entries.size();
+        if (n == 0) return;
+
+        // Compute initial positions
+        std::vector<ChunkPos> positions(n);
+        for (size_t i = 0; i < n; i++) positions[i] = GetChunkPos(Hash(entries[i].key));
+
+        // Batch insert with collision iteration + prefetch (matches Rust expand)
+        std::vector<size_t> active(n);
+        for (size_t i = 0; i < n; i++) active[i] = i;
+        size_t collisionBatch = 1;
+
+        while (!active.empty()) {
+            // Prefetch
+            for (size_t pi = 0; pi < std::min(active.size(), kHashMapPrefetchDist); pi++) {
+                Prefetch(positions[active[pi]]);
             }
-            pos = (pos + 1) & lastChunkIdx_;
+            std::vector<size_t> collisions;
+            for (size_t idx = 0; idx < active.size(); idx++) {
+                size_t pi = idx + kHashMapPrefetchDist;
+                if (pi < active.size()) Prefetch(positions[active[pi]]);
+
+                size_t ei = active[idx];
+                auto& e = entries[ei];
+                ChunkPos pos = positions[ei];
+                uint8_t tag = (Hash(e.key) >> 16) & 0x7F;
+                auto* chunk = chunks_ + pos;
+                bool inserted = false;
+                for (auto it = PHBitMask::MatchEmpty(chunk->GetU64Tags(), emptyTags_); it; ++it) {
+                    uint32_t slot = *it;
+                    size_++; chunk->TagsBuf()[slot] = tag;
+                    SetChunkKey(*chunk, slot, e.key);
+                    memcpy(ValueBuf(*chunk, slot), e.val, valueSize_);
+                    inserted = true; break;
+                }
+                if (!inserted) {
+                    positions[ei] = GetRehashPos(collisionBatch, pos);
+                    collisions.push_back(ei);
+                }
+            }
+            active = std::move(collisions);
+            collisionBatch++;
         }
     }
+
+    // Keep ExpandCapacityDirectly as alias for backward compat (Emplace scalar path)
+    void ExpandCapacityDirectly() { ExpandCapacity(); }
+    void ExpandCapacityIteratively() { ExpandCapacity(); }
 
     template <typename Filter, typename FInit, typename FUpdate>
     void EmplaceBatchDirectly(const Key* keys, int32_t numRows, Filter&& filter, FInit&& fInit, FUpdate&& fUpdate) {

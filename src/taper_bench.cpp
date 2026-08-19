@@ -33,10 +33,10 @@ BenchData GenData(size_t nStr,size_t nInt,size_t nKeys,size_t nProbe,double sel,
     for(auto&v:ps)v.reserve(nProbe); for(auto&v:pi)v.reserve(nProbe);
     std::vector<int64_t> ph; ph.reserve(nProbe);
     std::uniform_int_distribution<size_t> kd(0,nKeys-1);
-    for(size_t i=0;i<nH;i++){size_t idx=kd(rng);for(size_t c=0;c<nStr;c++)ps[c].push_back(d.strCols[c][idx]);for(size_t c=0;c<nInt;c++)pi[c].push_back(d.intCols[c][idx]);ph.push_back(bh[idx]);}
+    for(size_t i=0;i<nH;i++){size_t idx=rng()%nKeys;for(size_t c=0;c<nStr;c++)ps[c].push_back(d.strCols[c][idx]);for(size_t c=0;c<nInt;c++)pi[c].push_back(d.intCols[c][idx]);ph.push_back(bh[idx]);}
     for(size_t i=0;i<nM;i++){uint64_t h=0;for(size_t c=0;c<nStr;c++){auto s="miss_"+std::to_string(i)+"_"+std::to_string(c);std::vector<uint8_t>b(s.begin(),s.end());h=HB(b.data(),b.size(),h);ps[c].push_back(std::move(b));}for(size_t c=0;c<nInt;c++){int64_t v=int64_t(nKeys+1)*200+i*31+c;h=HC(h,v);pi[c].push_back(v);}ph.push_back(int64_t(h));}
     std::vector<size_t> ord(nProbe); std::iota(ord.begin(),ord.end(),0);
-    for(size_t i=nProbe-1;i>0;i--){std::uniform_int_distribution<size_t>dd(0,i);std::swap(ord[i],ord[dd(rng)]);}
+    for(size_t i=nProbe-1;i>0;i--){std::swap(ord[i],ord[rng()%(i+1)]);}
     for(size_t c=0;c<nStr;c++){auto tmp=std::move(ps[c]);ps[c].resize(nProbe);for(size_t i=0;i<nProbe;i++)ps[c][i]=std::move(tmp[ord[i]]);}
     for(size_t c=0;c<nInt;c++){auto tmp=pi[c];pi[c].resize(nProbe);for(size_t i=0;i<nProbe;i++)pi[c][i]=tmp[ord[i]];}
     {auto tmp=ph;for(size_t i=0;i<nProbe;i++)ph[i]=tmp[ord[i]];}

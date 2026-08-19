@@ -84,7 +84,8 @@ int main() {
         std::vector<taper::ColumnDesc> cd;
         cd.push_back(taper::ColumnDesc::Varchar);
         for(size_t c=0;c<NI;c++) cd.push_back(taper::ColumnDesc::Int64);
-        taper::TaperColumnSerializeHandler t(pool, 8, cd, HT);
+        // Use (TR+7)/8 chunks so initial capacity >= TR, avoiding any rehash/rebuild
+        taper::TaperColumnSerializeHandler t(pool, 8, cd, (TR + 7) / 8);
         std::vector<taper::ColumnInput> cols;
         cols.push_back(taper::ColumnInput::MakeVarchar(aptrs.data(), alens.data()));
         for(size_t c=0;c<NI;c++) cols.push_back(taper::ColumnInput::MakeInt64(allint[c].data()));
